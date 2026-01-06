@@ -220,21 +220,35 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
             is_target = g[target_mask_col].to_numpy(dtype=bool, copy=False)
             if not is_target.any():
                 continue
-            # positions in the sorted sequence that should be evaluated as targets
-            target_pos = np.flatnonzero(is_target)
+
+            target_pos = np.flatnonzero(is_target).astype(int, copy=False)
             rows = g.drop(columns=[target_mask_col])
-            for pos in target_pos:
-                prefix = rows.iloc[: pos + 1].copy()
-                pseudo_user = f"__rt_val__:{user!r}:{int(pos)}"
-                prefix[Columns.User] = pseudo_user
-                w = np.zeros(len(prefix), dtype=float)
-                # keep original weight for the target row if present, otherwise default to 1.0
-                try:
-                    w[-1] = float(prefix.iloc[-1][Columns.Weight])
-                except Exception:
-                    w[-1] = 1.0
-                prefix[Columns.Weight] = w
-                out_parts.append(prefix)
+
+            lens = target_pos + 1
+            total = int(lens.sum())
+            if total <= 0:
+                continue
+
+            starts = np.cumsum(np.r_[0, lens[:-1]])
+            seg_starts = np.repeat(starts, lens)
+            idx = np.arange(total) - seg_starts
+
+            pseudo_users = np.repeat(
+                [f"__rt_val__:{user!r}:{int(p)}" for p in target_pos],
+                lens,
+            )
+
+            expanded_user = rows.iloc[idx].copy()
+            expanded_user[Columns.User] = pseudo_users
+
+            w = np.zeros(total, dtype=float)
+            ends = np.cumsum(lens) - 1
+            try:
+                w[ends] = rows.iloc[target_pos][Columns.Weight].astype(float).to_numpy(copy=False)
+            except Exception:
+                w[ends] = 1.0
+            expanded_user[Columns.Weight] = w
+            out_parts.append(expanded_user)
 
         if not out_parts:
             return pd.DataFrame(columns=[c for c in df.columns if c != target_mask_col]), user_id_map
