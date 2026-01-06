@@ -139,6 +139,12 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         If ``True`` and `dataset_val` is provided, allow validation users that are not present in the
         train split by extending the train `user_id_map` with validation users. Items are still
         filtered to the train item id map.
+    val_strategy: str, default ``"leave_one_out"``
+        Strategy for constructing validation samples.
+        - ``"leave_one_out"``: one target per user/session (current RecTools behavior for SASRec/BERT4Rec val).
+        - ``"all_positions"``: create one validation sample per target interaction (like SA2C evaluation),
+          by expanding interactions into per-prefix pseudo-users. The model still uses a single target per
+          sample, but there may be many samples per original user/session.
     """
 
     # We sometimes need data preparators to add +1 to actual session_max_len
@@ -161,6 +167,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         extra_cols: tp.Optional[tp.List[str]] = None,
         add_unix_ts: bool = False,
         allow_new_users: bool = False,
+        val_strategy: str = "leave_one_out",
         **kwargs: tp.Any,
     ) -> None:
         self.item_id_map: IdMap
@@ -179,6 +186,74 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         self.extra_cols = extra_cols
         self.add_unix_ts = add_unix_ts
         self.allow_new_users = bool(allow_new_users)
+        self.val_strategy = str(val_strategy or "leave_one_out").strip() or "leave_one_out"
+        if self.val_strategy not in ("leave_one_out", "all_positions"):
+            raise ValueError(f"Unexpected val_strategy={self.val_strategy!r}")
+
+    @staticmethod
+    def _stable_sort_by_datetime(df: pd.DataFrame) -> pd.DataFrame:
+        if "_rt_row" in df.columns:
+            raise ValueError("Unexpected column name collision: '_rt_row'")
+        out = df.copy()
+        out["_rt_row"] = range(len(out))
+        out = out.sort_values([Columns.User, Columns.Datetime, "_rt_row"], kind="mergesort")
+        return out
+
+    def _expand_val_all_positions(
+        self,
+        df: pd.DataFrame,
+        *,
+        user_id_map: IdMap,
+        item_id_map: IdMap,
+        target_mask_col: str,
+        item_features: tp.Optional[Features],
+        keep_extra_cols: bool,
+        final_interactions_train: Interactions,
+    ) -> tp.Tuple[pd.DataFrame, IdMap]:
+        if target_mask_col not in df.columns:
+            raise ValueError(f"Missing {target_mask_col!r} in validation frame")
+
+        df = self._stable_sort_by_datetime(df)
+
+        out_parts: tp.List[pd.DataFrame] = []
+        for user, g in df.groupby(Columns.User, sort=False):
+            is_target = g[target_mask_col].to_numpy(dtype=bool, copy=False)
+            if not is_target.any():
+                continue
+            # positions in the sorted sequence that should be evaluated as targets
+            target_pos = np.flatnonzero(is_target)
+            rows = g.drop(columns=[target_mask_col])
+            for pos in target_pos:
+                prefix = rows.iloc[: pos + 1].copy()
+                pseudo_user = ("val", user, int(pos))
+                prefix[Columns.User] = pseudo_user
+                w = np.zeros(len(prefix), dtype=float)
+                # keep original weight for the target row if present, otherwise default to 1.0
+                try:
+                    w[-1] = float(prefix.iloc[-1][Columns.Weight])
+                except Exception:
+                    w[-1] = 1.0
+                prefix[Columns.Weight] = w
+                out_parts.append(prefix)
+
+        if not out_parts:
+            return pd.DataFrame(columns=[c for c in df.columns if c != target_mask_col]), user_id_map
+
+        expanded = pd.concat(out_parts, axis=0, ignore_index=True)
+        expanded_users = expanded[Columns.User].unique()
+        user_id_map = user_id_map.add_ids(expanded_users)
+        # keep train dataset consistent with expanded user id map
+        self.train_dataset = Dataset(
+            user_id_map,
+            item_id_map,
+            final_interactions_train,
+            item_features=item_features,
+        )
+        expanded = expanded.drop(columns=["_rt_row"], errors="ignore")
+        expanded = expanded.reset_index(drop=True)
+        expanded = expanded[[c for c in expanded.columns if c != "_rt_row"]]
+        # Return expanded interactions; caller will convert via Interactions.from_raw
+        return expanded, user_id_map
 
     def get_known_items_sorted_internal_ids(self) -> np.ndarray:
         """Return internal item ids from processed dataset in sorted order."""
@@ -297,12 +372,34 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                 (val_targets[Columns.User].isin(user_id_map.external_ids))
                 & (val_targets[Columns.Item].isin(item_id_map.external_ids))
             ]
-            val_interactions = interactions[interactions[Columns.User].isin(val_targets[Columns.User].unique())].copy()
-            val_interactions[Columns.Weight] = 0
-            val_interactions = pd.concat([val_interactions, val_targets], axis=0)
-            self.val_interactions = Interactions.from_raw(
-                val_interactions, user_id_map, item_id_map, keep_extra_cols=True
-            ).df
+            val_users = val_targets[Columns.User].unique()
+            val_context = interactions[interactions[Columns.User].isin(val_users)].copy()
+            val_context[Columns.Weight] = 0
+            if self.val_strategy == "leave_one_out":
+                val_interactions = pd.concat([val_context, val_targets], axis=0)
+                self.val_interactions = Interactions.from_raw(
+                    val_interactions, user_id_map, item_id_map, keep_extra_cols=True
+                ).df
+            else:
+                val_context = val_context.copy()
+                val_targets = val_targets.copy()
+                val_context["_rt_is_target"] = False
+                val_targets["_rt_is_target"] = True
+                full = pd.concat([val_context, val_targets], axis=0, ignore_index=True)
+                expanded, user_id_map = self._expand_val_all_positions(
+                    full,
+                    user_id_map=user_id_map,
+                    item_id_map=item_id_map,
+                    target_mask_col="_rt_is_target",
+                    item_features=item_features,
+                    keep_extra_cols=True,
+                    final_interactions_train=final_interactions,
+                )
+                if len(expanded) == 0:
+                    raise AssertionError("val_strategy='all_positions' produced empty validation interactions")
+                self.val_interactions = Interactions.from_raw(
+                    expanded, user_id_map, item_id_map, keep_extra_cols=True
+                ).df
         elif dataset_val is not None:
             raw_val = dataset_val.get_raw_interactions(include_extra_cols=extra_cols)
             required_cols = [Columns.User, Columns.Item, Columns.Datetime]
@@ -334,6 +431,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                     item_features=item_features,
                 )
 
+            # For dataset_val we treat interactions with non-zero weight as targets (by default all rows are targets).
             if self.allow_new_users:
                 val_targets = raw_val[items_ok_mask]
             else:
@@ -353,6 +451,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                 msg = (
                     "Validation dataloader is empty after filtering dataset_val to train id maps. "
                     f"allow_new_users={self.allow_new_users} "
+                    f"val_strategy={self.val_strategy!r} "
                     f"train_users={n_train_users} train_items={n_train_items} "
                     f"val_rows={int(len(raw_val))} val_users={n_val_users} val_items={n_val_items} "
                     f"overlap_users_pre={n_overlap_users_pre} overlap_items={n_overlap_items} "
@@ -364,24 +463,47 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
             val_users = val_targets[Columns.User].unique()
             val_context = interactions[interactions[Columns.User].isin(val_users)].copy()
             val_context[Columns.Weight] = 0
-            val_interactions = pd.concat([val_context, val_targets], axis=0, ignore_index=True)
-            self.val_interactions = Interactions.from_raw(
-                val_interactions, user_id_map, item_id_map, keep_extra_cols=True
-            ).df
-            assert len(self.val_interactions) > 0, "Expected non-empty val_interactions when dataset_val is provided"
-            counts = self.val_interactions.groupby(Columns.User, sort=False).size()
-            too_short = counts[counts < 2]
-            if len(too_short) > 0:
-                sample_internal = too_short.index[:10].to_numpy()
-                sample_external = user_id_map.convert_to_external(sample_internal, strict=False)
-                msg = (
-                    "Validation contains sessions/users with <2 interactions (cannot form context+target for val). "
-                    f"n_users_too_short={int(len(too_short))} "
-                    f"min_len={int(too_short.min())} max_len={int(too_short.max())} "
-                    f"examples_internal={sample_internal.tolist()} examples_external={sample_external.tolist()}"
+
+            if self.val_strategy == "leave_one_out":
+                val_interactions = pd.concat([val_context, val_targets], axis=0, ignore_index=True)
+                self.val_interactions = Interactions.from_raw(
+                    val_interactions, user_id_map, item_id_map, keep_extra_cols=True
+                ).df
+                assert len(self.val_interactions) > 0, "Expected non-empty val_interactions when dataset_val is provided"
+                counts = self.val_interactions.groupby(Columns.User, sort=False).size()
+                too_short = counts[counts < 2]
+                if len(too_short) > 0:
+                    sample_internal = too_short.index[:10].to_numpy()
+                    sample_external = user_id_map.convert_to_external(sample_internal, strict=False)
+                    msg = (
+                        "Validation contains sessions/users with <2 interactions (cannot form context+target for val). "
+                        f"n_users_too_short={int(len(too_short))} "
+                        f"min_len={int(too_short.min())} max_len={int(too_short.max())} "
+                        f"examples_internal={sample_internal.tolist()} examples_external={sample_external.tolist()}"
+                    )
+                    _LOGGER.error(msg)
+                    raise AssertionError(msg)
+            else:
+                val_context = val_context.copy()
+                val_targets = val_targets.copy()
+                val_context["_rt_is_target"] = False
+                # Treat non-zero weights as target candidates in the provided validation dataset.
+                val_targets["_rt_is_target"] = val_targets[Columns.Weight].astype(float) != 0.0
+                full = pd.concat([val_context, val_targets], axis=0, ignore_index=True)
+                expanded, user_id_map = self._expand_val_all_positions(
+                    full,
+                    user_id_map=user_id_map,
+                    item_id_map=item_id_map,
+                    target_mask_col="_rt_is_target",
+                    item_features=item_features,
+                    keep_extra_cols=True,
+                    final_interactions_train=final_interactions,
                 )
-                _LOGGER.error(msg)
-                raise AssertionError(msg)
+                if len(expanded) == 0:
+                    raise AssertionError("val_strategy='all_positions' produced empty validation interactions")
+                self.val_interactions = Interactions.from_raw(
+                    expanded, user_id_map, item_id_map, keep_extra_cols=True
+                ).df
 
     def _init_extra_token_ids(self) -> None:
         extra_token_ids = self.item_id_map.convert_to_internal(self.item_extra_tokens)

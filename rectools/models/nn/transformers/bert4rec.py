@@ -103,6 +103,7 @@ class BERT4RecDataPreparator(TransformerDataPreparatorBase):
             shuffle_train=shuffle_train,
             get_val_mask_func=get_val_mask_func,
             get_val_mask_func_kwargs=get_val_mask_func_kwargs,
+            **kwargs,
         )
         self.mask_prob = mask_prob
 

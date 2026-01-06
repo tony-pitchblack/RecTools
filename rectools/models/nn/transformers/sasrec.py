@@ -128,7 +128,8 @@ class SASRecDataPreparator(TransformerDataPreparatorBase):
             target_idx = [idx for idx, weight in enumerate(ses_weights) if weight != 0][0]
 
             # ses: [session_len] -> x[i]: [session_max_len]
-            x[i, -len(input_session) :] = input_session[-self.session_max_len :]
+            if len(input_session) > 0:
+                x[i, -len(input_session) :] = input_session[-self.session_max_len :]
             y[i, -1:] = ses[target_idx]  # y[i]: [1]
             yw[i, -1:] = ses_weights[target_idx]  # yw[i]: [1]
 
@@ -140,10 +141,11 @@ class SASRecDataPreparator(TransformerDataPreparatorBase):
         if self.add_unix_ts:
             t = np.zeros((batch_size, self.session_max_len + 1))  # +1 target item timestamp
             for i, (ses, _, extras) in enumerate(batch):
-                t[i, -len(ses) + 1 :] = extras["unix_ts"][1:]
-                len_to_pad = self.session_max_len + 2 - len(ses)
-                if len_to_pad > 0:
-                    t[i, :len_to_pad] = t[i, len_to_pad]
+                if len(ses) >= 2:
+                    t[i, -len(ses) + 1 :] = extras["unix_ts"][1:]
+                    len_to_pad = self.session_max_len + 2 - len(ses)
+                    if len_to_pad > 0:
+                        t[i, :len_to_pad] = t[i, len_to_pad]
             batch_dict.update({"unix_ts": torch.LongTensor(t)})
         return batch_dict
 
