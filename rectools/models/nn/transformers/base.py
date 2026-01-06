@@ -463,8 +463,8 @@ class TransformerModelBase(ModelBase[TransformerModelConfig_T]):  # pylint: disa
             **self._get_kwargs(self.lightning_module_kwargs),
         )
 
-    def _build_model_from_dataset(self, dataset: Dataset) -> None:
-        self.data_preparator.process_dataset_train(dataset)
+    def _build_model_from_dataset(self, dataset: Dataset, dataset_val: tp.Optional[Dataset] = None) -> None:
+        self.data_preparator.process_dataset_train(dataset, dataset_val=dataset_val)
         item_model = self._construct_item_net(self.data_preparator.train_dataset)
         torch_model = self._init_torch_model(item_model)
 
@@ -478,11 +478,14 @@ class TransformerModelBase(ModelBase[TransformerModelConfig_T]):  # pylint: disa
             model_config=model_config,
         )
 
-    def _fit(
-        self,
-        dataset: Dataset,
-    ) -> None:
-        self._build_model_from_dataset(dataset)
+    def _fit(self, dataset: Dataset, *args: tp.Any, **kwargs: tp.Any) -> None:
+        if args:
+            raise TypeError("Unexpected positional args for fit()")
+        dataset_val = kwargs.pop("dataset_val", None)
+        if kwargs:
+            raise TypeError(f"Unexpected keyword args for fit(): {sorted(kwargs.keys())}")
+
+        self._build_model_from_dataset(dataset, dataset_val=dataset_val)
         train_dataloader = self.data_preparator.get_dataloader_train()
         val_dataloader = self.data_preparator.get_dataloader_val()
         self.fit_trainer = deepcopy(self._trainer)
@@ -502,20 +505,21 @@ class TransformerModelBase(ModelBase[TransformerModelConfig_T]):  # pylint: disa
     ) -> Dataset:
         return self.data_preparator.transform_dataset_i2i(dataset)
 
-    def _fit_partial(
-        self,
-        dataset: Dataset,
-        min_epochs: int,
-        max_epochs: int,
-    ) -> None:
+    def _fit_partial(self, dataset: Dataset, min_epochs: int, max_epochs: int, *args: tp.Any, **kwargs: tp.Any) -> None:
+        if args:
+            raise TypeError("Unexpected positional args for fit_partial()")
+        dataset_val = kwargs.pop("dataset_val", None)
+        if kwargs:
+            raise TypeError(f"Unexpected keyword args for fit_partial(): {sorted(kwargs.keys())}")
+
         if not self.is_fitted:
-            self._build_model_from_dataset(dataset)
+            self._build_model_from_dataset(dataset, dataset_val=dataset_val)
             self.fit_trainer = deepcopy(self._trainer)
         else:
             # assumed that dataset is same as in `fit` or as in first call to `fit_partial`
             # currently new datasets is not supported due to difficulties with
             # handling id maps and item (user) features
-            self.data_preparator.process_dataset_train(dataset)
+            self.data_preparator.process_dataset_train(dataset, dataset_val=dataset_val)
             if self.fit_trainer is None:
                 raise RuntimeError("expected to have fit_trainer set")
 

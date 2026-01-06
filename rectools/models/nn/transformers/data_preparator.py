@@ -226,12 +226,24 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
     def _convert_to_unix_ts(self, datetime: pd.Series) -> pd.Series:
         return (datetime.values.astype("int64") / 10**9).astype("int64")
 
-    def process_dataset_train(self, dataset: Dataset) -> None:
-        """Process train dataset and save data."""
+    def process_dataset_train(self, dataset: Dataset, dataset_val: tp.Optional[Dataset] = None) -> None:
+        """Process train dataset and save data.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Train dataset.
+        dataset_val : optional(Dataset), default ``None``
+            Optional validation dataset. If provided, validation interactions are taken from this
+            dataset and `get_val_mask_func` must be ``None``.
+        """
         extra_cols = False if self.extra_cols is None else self.extra_cols
         raw_interactions = dataset.get_raw_interactions(include_extra_cols=extra_cols)
         if self.add_unix_ts:
             raw_interactions["unix_ts"] = self._convert_to_unix_ts(raw_interactions[Columns.Datetime])
+
+        if dataset_val is not None and self.get_val_mask_func is not None:
+            raise ValueError("Specify either `dataset_val` or `get_val_mask_func`, not both")
 
         # Exclude val interaction targets from train if needed
         interactions = raw_interactions
@@ -279,6 +291,36 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
             val_interactions = interactions[interactions[Columns.User].isin(val_targets[Columns.User].unique())].copy()
             val_interactions[Columns.Weight] = 0
             val_interactions = pd.concat([val_interactions, val_targets], axis=0)
+            self.val_interactions = Interactions.from_raw(
+                val_interactions, user_id_map, item_id_map, keep_extra_cols=True
+            ).df
+        elif dataset_val is not None:
+            raw_val = dataset_val.get_raw_interactions(include_extra_cols=extra_cols)
+            required_cols = [Columns.User, Columns.Item, Columns.Datetime]
+            missing = [c for c in required_cols if c not in raw_val.columns]
+            if missing:
+                raise ValueError(f"dataset_val interactions are missing required columns: {missing}")
+
+            if Columns.Weight not in raw_val.columns:
+                raw_val = raw_val.copy()
+                raw_val[Columns.Weight] = 1.0
+
+            if self.add_unix_ts:
+                raw_val = raw_val.copy()
+                raw_val["unix_ts"] = self._convert_to_unix_ts(raw_val[Columns.Datetime])
+
+            val_targets = raw_val[
+                (raw_val[Columns.User].isin(user_id_map.external_ids))
+                & (raw_val[Columns.Item].isin(item_id_map.external_ids))
+            ]
+            if len(val_targets) == 0:
+                self.val_interactions = None
+                return
+
+            val_users = val_targets[Columns.User].unique()
+            val_context = interactions[interactions[Columns.User].isin(val_users)].copy()
+            val_context[Columns.Weight] = 0
+            val_interactions = pd.concat([val_context, val_targets], axis=0, ignore_index=True)
             self.val_interactions = Interactions.from_raw(
                 val_interactions, user_id_map, item_id_map, keep_extra_cols=True
             ).df
