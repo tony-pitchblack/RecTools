@@ -135,6 +135,10 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         from the beginning of the epoch
     extra_cols: optional(List[str]), default ``None``
         Extra columns to keep in train and recommend datasets.
+    allow_new_users: bool, default ``False``
+        If ``True`` and `dataset_val` is provided, allow validation users that are not present in the
+        train split by extending the train `user_id_map` with validation users. Items are still
+        filtered to the train item id map.
     """
 
     # We sometimes need data preparators to add +1 to actual session_max_len
@@ -156,6 +160,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         get_val_mask_func_kwargs: tp.Optional[InitKwargs] = None,
         extra_cols: tp.Optional[tp.List[str]] = None,
         add_unix_ts: bool = False,
+        allow_new_users: bool = False,
         **kwargs: tp.Any,
     ) -> None:
         self.item_id_map: IdMap
@@ -173,6 +178,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
         self.get_val_mask_func_kwargs = get_val_mask_func_kwargs
         self.extra_cols = extra_cols
         self.add_unix_ts = add_unix_ts
+        self.allow_new_users = bool(allow_new_users)
 
     def get_known_items_sorted_internal_ids(self) -> np.ndarray:
         """Return internal item ids from processed dataset in sorted order."""
@@ -312,25 +318,44 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                 raw_val = raw_val.copy()
                 raw_val["unix_ts"] = self._convert_to_unix_ts(raw_val[Columns.Datetime])
 
-            val_targets = raw_val[
-                (raw_val[Columns.User].isin(user_id_map.external_ids))
-                & (raw_val[Columns.Item].isin(item_id_map.external_ids))
-            ]
+            train_user_external_ids_pre = user_id_map.external_ids
+            raw_val_users = raw_val[Columns.User].unique()
+            raw_val_items = raw_val[Columns.Item].unique()
+            items_ok_mask = raw_val[Columns.Item].isin(item_id_map.external_ids)
+
+            # Optional: allow validation users not present in train by extending user id map.
+            if self.allow_new_users:
+                user_id_map = user_id_map.add_ids(raw_val_users)
+                # keep train dataset consistent with expanded user id map
+                self.train_dataset = Dataset(
+                    user_id_map,
+                    item_id_map,
+                    final_interactions,
+                    item_features=item_features,
+                )
+
+            if self.allow_new_users:
+                val_targets = raw_val[items_ok_mask]
+            else:
+                val_targets = raw_val[
+                    items_ok_mask & raw_val[Columns.User].isin(user_id_map.external_ids)
+                ]
             if len(val_targets) == 0:
                 n_train_users = int(len(user_id_map.external_ids))
                 n_train_items = int(len(item_id_map.external_ids) - self.n_item_extra_tokens)
-                raw_val_users = raw_val[Columns.User].unique()
-                raw_val_items = raw_val[Columns.Item].unique()
                 n_val_users = int(len(raw_val_users))
                 n_val_items = int(len(raw_val_items))
-                n_overlap_users = int(pd.Index(raw_val_users).isin(user_id_map.external_ids).sum())
                 n_overlap_items = int(pd.Index(raw_val_items).isin(item_id_map.external_ids).sum())
+                # Note: if allow_new_users=True we may have extended user_id_map above, so we also show
+                # overlap with the original (pre-extension) train users for debugging.
+                n_overlap_users_pre = int(pd.Index(raw_val_users).isin(train_user_external_ids_pre).sum())
 
                 msg = (
                     "Validation dataloader is empty after filtering dataset_val to train id maps. "
+                    f"allow_new_users={self.allow_new_users} "
                     f"train_users={n_train_users} train_items={n_train_items} "
                     f"val_rows={int(len(raw_val))} val_users={n_val_users} val_items={n_val_items} "
-                    f"overlap_users={n_overlap_users} overlap_items={n_overlap_items} "
+                    f"overlap_users_pre={n_overlap_users_pre} overlap_items={n_overlap_items} "
                     f"(note: items include {self.n_item_extra_tokens} extra tokens in the internal map)."
                 )
                 _LOGGER.error(msg)
