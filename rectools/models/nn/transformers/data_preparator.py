@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import logging
 import typing as tp
 import warnings
 from collections.abc import Hashable
@@ -34,6 +35,8 @@ from .negative_sampler import TransformerNegativeSamplerBase
 InitKwargs = tp.Dict[str, tp.Any]
 # (user session, session weights, extra columns)
 BatchElement = tp.Tuple[tp.List[int], tp.List[float], tp.Dict[str, tp.List[tp.Any]]]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SequenceDataset(TorchDataset):
@@ -314,8 +317,24 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                 & (raw_val[Columns.Item].isin(item_id_map.external_ids))
             ]
             if len(val_targets) == 0:
-                self.val_interactions = None
-                return
+                n_train_users = int(len(user_id_map.external_ids))
+                n_train_items = int(len(item_id_map.external_ids) - self.n_item_extra_tokens)
+                raw_val_users = raw_val[Columns.User].unique()
+                raw_val_items = raw_val[Columns.Item].unique()
+                n_val_users = int(len(raw_val_users))
+                n_val_items = int(len(raw_val_items))
+                n_overlap_users = int(pd.Index(raw_val_users).isin(user_id_map.external_ids).sum())
+                n_overlap_items = int(pd.Index(raw_val_items).isin(item_id_map.external_ids).sum())
+
+                msg = (
+                    "Validation dataloader is empty after filtering dataset_val to train id maps. "
+                    f"train_users={n_train_users} train_items={n_train_items} "
+                    f"val_rows={int(len(raw_val))} val_users={n_val_users} val_items={n_val_items} "
+                    f"overlap_users={n_overlap_users} overlap_items={n_overlap_items} "
+                    f"(note: items include {self.n_item_extra_tokens} extra tokens in the internal map)."
+                )
+                _LOGGER.error(msg)
+                raise AssertionError(msg)
 
             val_users = val_targets[Columns.User].unique()
             val_context = interactions[interactions[Columns.User].isin(val_users)].copy()
@@ -324,6 +343,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
             self.val_interactions = Interactions.from_raw(
                 val_interactions, user_id_map, item_id_map, keep_extra_cols=True
             ).df
+            assert len(self.val_interactions) > 0, "Expected non-empty val_interactions when dataset_val is provided"
 
     def _init_extra_token_ids(self) -> None:
         extra_token_ids = self.item_id_map.convert_to_internal(self.item_extra_tokens)
