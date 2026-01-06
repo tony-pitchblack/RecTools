@@ -369,6 +369,19 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
                 val_interactions, user_id_map, item_id_map, keep_extra_cols=True
             ).df
             assert len(self.val_interactions) > 0, "Expected non-empty val_interactions when dataset_val is provided"
+            counts = self.val_interactions.groupby(Columns.User, sort=False).size()
+            too_short = counts[counts < 2]
+            if len(too_short) > 0:
+                sample_internal = too_short.index[:10].to_numpy()
+                sample_external = user_id_map.convert_to_external(sample_internal, strict=False)
+                msg = (
+                    "Validation contains sessions/users with <2 interactions (cannot form context+target for val). "
+                    f"n_users_too_short={int(len(too_short))} "
+                    f"min_len={int(too_short.min())} max_len={int(too_short.max())} "
+                    f"examples_internal={sample_internal.tolist()} examples_external={sample_external.tolist()}"
+                )
+                _LOGGER.error(msg)
+                raise AssertionError(msg)
 
     def _init_extra_token_ids(self) -> None:
         extra_token_ids = self.item_id_map.convert_to_internal(self.item_extra_tokens)
