@@ -225,7 +225,7 @@ class TransformerDataPreparatorBase:  # pylint: disable=too-many-instance-attrib
             rows = g.drop(columns=[target_mask_col])
             for pos in target_pos:
                 prefix = rows.iloc[: pos + 1].copy()
-                pseudo_user = ("val", user, int(pos))
+                pseudo_user = f"__rt_val__:{user!r}:{int(pos)}"
                 prefix[Columns.User] = pseudo_user
                 w = np.zeros(len(prefix), dtype=float)
                 # keep original weight for the target row if present, otherwise default to 1.0
